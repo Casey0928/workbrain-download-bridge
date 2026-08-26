@@ -1,0 +1,159 @@
+name: Download URL to Google Drive
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "HTTPS file URL"
+        required: true
+        type: string
+      filename:
+        description: "Destination filename, e.g. test.pdf"
+        required: true
+        type: string
+      drive_path:
+        description: "Google Drive destination path"
+        required: true
+        default: "WorkBrain/Downloads"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  download-to-drive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    env:
+      SOURCE_URL: ${{ inputs.url }}
+      DEST_FILENAME: ${{ inputs.filename }}
+      DRIVE_PATH: ${{ inputs.drive_path }}
+
+    steps:
+      - name: Validate inputs
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import ipaddress
+          import os
+          import socket
+          from urllib.parse import urlsplit
+
+          url = os.environ["SOURCE_URL"].strip()
+          filename = os.environ["DEST_FILENAME"].strip()
+          drive_path = os.environ["DRIVE_PATH"].strip()
+
+          p = urlsplit(url)
+          if p.scheme != "https":
+              raise SystemExit("Only https:// URLs are allowed.")
+          if not p.hostname:
+              raise SystemExit("URL hostname is required.")
+          if p.username or p.password:
+              raise SystemExit("Credentials embedded in URLs are not allowed.")
+
+          if (
+              not filename
+              or filename in {".", ".."}
+              or "/" in filename
+              or "\\" in filename
+              or any(ord(c) < 32 for c in filename)
+          ):
+              raise SystemExit("Invalid destination filename.")
+          if not drive_path or ".." in drive_path.split("/"):
+              raise SystemExit("Invalid Drive path.")
+
+          host = p.hostname.lower()
+          if host in {"localhost", "localhost.localdomain"}:
+              raise SystemExit("Localhost is not allowed.")
+
+          try:
+              infos = socket.getaddrinfo(host, p.port or 443, type=socket.SOCK_STREAM)
+          except socket.gaierror as e:
+              raise SystemExit(f"DNS resolution failed: {e}")
+
+          for info in infos:
+              addr = info[4][0]
+              ip = ipaddress.ip_address(addr)
+              if (
+                  ip.is_private
+                  or ip.is_loopback
+                  or ip.is_link_local
+                  or ip.is_multicast
+                  or ip.is_reserved
+                  or ip.is_unspecified
+              ):
+                  raise SystemExit(f"Refusing non-public destination IP: {ip}")
+
+          print("Input validation OK")
+          PY
+
+      - name: Install rclone
+        shell: bash
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y rclone
+
+      - name: Restore Google Drive credentials
+        shell: bash
+        env:
+          RCLONE_CONFIG_B64: ${{ secrets.RCLONE_CONFIG_B64 }}
+        run: |
+          test -n "$RCLONE_CONFIG_B64" || {
+            echo "Missing repository secret: RCLONE_CONFIG_B64"
+            exit 1
+          }
+          mkdir -p "$HOME/.config/rclone"
+          printf '%s' "$RCLONE_CONFIG_B64" | base64 --decode > "$HOME/.config/rclone/rclone.conf"
+          chmod 600 "$HOME/.config/rclone/rclone.conf"
+          rclone listremotes | grep -qx 'gdrive:' || {
+            echo "rclone config must contain a remote named gdrive"
+            exit 1
+          }
+
+      - name: Stream URL directly to Google Drive
+        id: transfer
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          REMOTE_PATH="${DRIVE_PATH%/}/${DEST_FILENAME}"
+          HASH_FILE="$RUNNER_TEMP/sha256.txt"
+
+          curl \
+            --proto '=https' \
+            --tlsv1.2 \
+            --fail \
+            --location \
+            --retry 4 \
+            --retry-all-errors \
+            --connect-timeout 30 \
+            --speed-time 60 \
+            --speed-limit 1024 \
+            --silent \
+            --show-error \
+            "$SOURCE_URL" \
+          | tee >(sha256sum | awk '{print $1}' > "$HASH_FILE") \
+          | rclone rcat "gdrive:${REMOTE_PATH}" \
+              --stats 30s \
+              --stats-one-line \
+              --retries 4 \
+              --low-level-retries 10
+
+          SHA256="$(cat "$HASH_FILE")"
+          echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
+          echo "remote_path=$REMOTE_PATH" >> "$GITHUB_OUTPUT"
+          rclone lsl "gdrive:${REMOTE_PATH}"
+
+      - name: Summary
+        shell: bash
+        run: |
+          {
+            echo "## Download completed"
+            echo
+            echo "- Source: \`${SOURCE_URL}\`"
+            echo "- Drive: \`gdrive:${{ steps.transfer.outputs.remote_path }}\`"
+            echo "- SHA-256: \`${{ steps.transfer.outputs.sha256 }}\`"
+            echo
+            echo "No GitHub Actions Artifact or cache was created."
+          } >> "$GITHUB_STEP_SUMMARY"
