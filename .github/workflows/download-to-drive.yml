@@ -50,13 +50,11 @@ jobs:
             -H "Content-Type: application/json" \
             -d "{\"op\":\"claim\",\"run_id\":${GITHUB_RUN_ID}}")"
           printf '%s\n' "$RESPONSE" | jq .
-
           JOB_ID="$(printf '%s' "$RESPONSE" | jq -r '.job.id // empty')"
           if [ -z "$JOB_ID" ]; then
             echo "has_job=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-
           printf '%s' "$RESPONSE" | jq -r '.job.source_url' > "$RUNNER_TEMP/source_url"
           printf '%s' "$RESPONSE" | jq -r '.job.filename' > "$RUNNER_TEMP/filename"
           printf '%s' "$RESPONSE" | jq -r '.job.drive_path' > "$RUNNER_TEMP/drive_path"
@@ -75,7 +73,6 @@ jobs:
           python3 - <<'PY'
           import ipaddress, os, socket
           from urllib.parse import urlsplit
-
           url = os.environ["SOURCE_URL"].strip()
           filename = os.environ["DEST_FILENAME"].strip()
           drive_path = os.environ["DRIVE_PATH"].strip()
@@ -136,60 +133,98 @@ jobs:
             "$SOURCE_URL"
           SIZE="$(stat -c%s "$OUT")"
           SHA256="$(sha256sum "$OUT" | awk '{print $1}')"
+          MIME_TYPE="$(file --brief --mime-type "$OUT" || echo application/octet-stream)"
           echo "size=$SIZE" >> "$GITHUB_OUTPUT"
           echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
-          echo "Downloaded $SIZE bytes; sha256=$SHA256"
+          echo "mime_type=$MIME_TYPE" >> "$GITHUB_OUTPUT"
+          echo "Downloaded $SIZE bytes; sha256=$SHA256; mime=$MIME_TYPE"
 
-      - name: Report smoke-test success
+      - name: Request one-time Drive upload session
         if: steps.claim.outputs.has_job == 'true' && steps.download.outcome == 'success'
+        id: session
+        continue-on-error: true
+        shell: bash
+        env:
+          OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+          JOB_ID: ${{ steps.claim.outputs.job_id }}
+          MIME_TYPE: ${{ steps.download.outputs.mime_type }}
+        run: |
+          set -Eeuo pipefail
+          RESPONSE="$(jq -nc --arg job_id "$JOB_ID" --arg mime_type "$MIME_TYPE" '{op:"upload_session",job_id:$job_id,mime_type:$mime_type}' \
+            | curl --fail --silent --show-error \
+                -X POST "$WORKER_URL" \
+                -H "Authorization: Bearer $OIDC_TOKEN" \
+                -H "Content-Type: application/json" \
+                --data-binary @-)"
+          printf '%s\n' "$RESPONSE" | jq .
+          UPLOAD_URL="$(printf '%s' "$RESPONSE" | jq -r '.upload_url // empty')"
+          test -n "$UPLOAD_URL"
+          printf '%s' "$UPLOAD_URL" > "$RUNNER_TEMP/drive_upload_url"
+
+      - name: Upload file directly to Google Drive
+        if: steps.claim.outputs.has_job == 'true' && steps.download.outcome == 'success' && steps.session.outcome == 'success'
+        id: upload
+        continue-on-error: true
+        shell: bash
+        env:
+          MIME_TYPE: ${{ steps.download.outputs.mime_type }}
+        run: |
+          set -Eeuo pipefail
+          OUT="$RUNNER_TEMP/workbrain-download.bin"
+          UPLOAD_URL="$(cat "$RUNNER_TEMP/drive_upload_url")"
+          RESPONSE_FILE="$RUNNER_TEMP/drive_response.json"
+          curl --fail --silent --show-error \
+            -X PUT "$UPLOAD_URL" \
+            -H "Content-Type: $MIME_TYPE" \
+            --upload-file "$OUT" \
+            -o "$RESPONSE_FILE"
+          cat "$RESPONSE_FILE" | jq .
+          DRIVE_FILE_ID="$(jq -r '.id // empty' "$RESPONSE_FILE")"
+          DRIVE_URL="$(jq -r '.webViewLink // empty' "$RESPONSE_FILE")"
+          test -n "$DRIVE_FILE_ID"
+          echo "drive_file_id=$DRIVE_FILE_ID" >> "$GITHUB_OUTPUT"
+          echo "drive_url=$DRIVE_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Report completed upload
+        if: steps.claim.outputs.has_job == 'true' && steps.upload.outcome == 'success'
         shell: bash
         env:
           OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
           JOB_ID: ${{ steps.claim.outputs.job_id }}
           SIZE: ${{ steps.download.outputs.size }}
           SHA256: ${{ steps.download.outputs.sha256 }}
+          DRIVE_FILE_ID: ${{ steps.upload.outputs.drive_file_id }}
+          DRIVE_URL: ${{ steps.upload.outputs.drive_url }}
         run: |
-          curl --fail --silent --show-error \
-            -X POST "$WORKER_URL" \
-            -H "Authorization: Bearer $OIDC_TOKEN" \
-            -H "Content-Type: application/json" \
-            --data-binary @- <<JSON | jq .
-          {
-            "op":"update",
-            "job_id":"$JOB_ID",
-            "status":"completed",
-            "size_bytes":$SIZE,
-            "bytes_downloaded":$SIZE,
-            "sha256":"$SHA256",
-            "metadata":{
-              "bridge_phase":"github_download_smoke_test",
-              "online_download_verified":true,
-              "drive_upload_verified":false,
-              "runner":"ubuntu-latest"
-            }
-          }
-          JSON
+          jq -nc \
+            --arg job_id "$JOB_ID" \
+            --arg sha256 "$SHA256" \
+            --arg drive_file_id "$DRIVE_FILE_ID" \
+            --arg drive_url "$DRIVE_URL" \
+            --argjson size "$SIZE" \
+            '{op:"update",job_id:$job_id,status:"completed",size_bytes:$size,bytes_downloaded:$size,sha256:$sha256,drive_file_id:$drive_file_id,drive_url:$drive_url,metadata:{bridge_phase:"github_to_drive_verified",online_download_verified:true,drive_upload_verified:true,runner:"ubuntu-latest"}}' \
+          | curl --fail --silent --show-error \
+              -X POST "$WORKER_URL" \
+              -H "Authorization: Bearer $OIDC_TOKEN" \
+              -H "Content-Type: application/json" \
+              --data-binary @- | jq .
 
-      - name: Report download failure
-        if: steps.claim.outputs.has_job == 'true' && steps.download.outcome == 'failure'
+      - name: Report failure
+        if: steps.claim.outputs.has_job == 'true' && (steps.download.outcome == 'failure' || steps.session.outcome == 'failure' || steps.upload.outcome == 'failure')
         shell: bash
         env:
           OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
           JOB_ID: ${{ steps.claim.outputs.job_id }}
         run: |
-          curl --silent --show-error \
-            -X POST "$WORKER_URL" \
-            -H "Authorization: Bearer $OIDC_TOKEN" \
-            -H "Content-Type: application/json" \
-            --data-binary @- <<JSON | jq .
-          {
-            "op":"update",
-            "job_id":"$JOB_ID",
-            "status":"failed",
-            "error_detail":"GitHub runner could not download the source URL",
-            "metadata":{"bridge_phase":"github_download_smoke_test"}
-          }
-          JSON
+          if [ "${{ steps.download.outcome }}" = "failure" ]; then MSG="GitHub runner could not download the source URL";
+          elif [ "${{ steps.session.outcome }}" = "failure" ]; then MSG="Supabase could not create a Google Drive upload session";
+          else MSG="Google Drive upload failed"; fi
+          jq -nc --arg job_id "$JOB_ID" --arg msg "$MSG" '{op:"update",job_id:$job_id,status:"failed",error_detail:$msg,metadata:{bridge_phase:"github_to_drive"}}' \
+          | curl --silent --show-error \
+              -X POST "$WORKER_URL" \
+              -H "Authorization: Bearer $OIDC_TOKEN" \
+              -H "Content-Type: application/json" \
+              --data-binary @- | jq .
           exit 1
 
       - name: Summary
@@ -202,6 +237,7 @@ jobs:
             echo "- Repository: $GITHUB_REPOSITORY"
             echo "- Trigger: $GITHUB_EVENT_NAME"
             echo "- GitHub -> Supabase auth: OIDC (no PAT)"
+            echo "- Google Drive credential on GitHub: none"
             echo "- GitHub Artifact/cache: not used"
-            echo "- Google Drive upload: next integration stage"
+            echo "- Drive upload: Supabase-issued one-time resumable session"
           } >> "$GITHUB_STEP_SUMMARY"
