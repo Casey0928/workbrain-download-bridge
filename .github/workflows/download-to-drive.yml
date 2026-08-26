@@ -1,127 +1,125 @@
-name: Download URL to Google Drive
+name: WorkBrain Download Worker
 
 on:
   workflow_dispatch:
-    inputs:
-      url:
-        description: "HTTPS file URL"
-        required: true
-        type: string
-      filename:
-        description: "Destination filename, e.g. test.pdf"
-        required: true
-        type: string
-      drive_path:
-        description: "Google Drive destination path"
-        required: true
-        default: "WorkBrain/Downloads"
-        type: string
+  schedule:
+    - cron: "*/5 * * * *"
   push:
     paths:
-      - ".github/test-download-trigger.txt"
+      - ".github/workbrain-trigger.txt"
 
 permissions:
   contents: read
+  id-token: write
+
+concurrency:
+  group: workbrain-download-worker
+  cancel-in-progress: false
 
 jobs:
-  download-to-drive:
+  worker:
     runs-on: ubuntu-latest
     timeout-minutes: 180
-
     env:
-      SOURCE_URL: ${{ github.event_name == 'workflow_dispatch' && inputs.url || 'https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf' }}
-      DEST_FILENAME: ${{ github.event_name == 'workflow_dispatch' && inputs.filename || 'github-actions-bridge-test.pdf' }}
-      DRIVE_PATH: ${{ github.event_name == 'workflow_dispatch' && inputs.drive_path || 'WorkBrain/Downloads' }}
+      WORKER_URL: "https://mttaigtrzlwpgjnpegmt.supabase.co/functions/v1/github-download-worker"
+      OIDC_AUDIENCE: "workbrain-download-bridge"
 
     steps:
-      - name: Validate inputs
+      - name: Get GitHub OIDC token
+        id: oidc
         shell: bash
         run: |
+          set -Eeuo pipefail
+          RESPONSE="$(curl --fail --silent --show-error \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${OIDC_AUDIENCE}")"
+          TOKEN="$(printf '%s' "$RESPONSE" | jq -r '.value')"
+          test -n "$TOKEN" && test "$TOKEN" != "null"
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+
+      - name: Claim oldest WorkBrain job
+        id: claim
+        shell: bash
+        env:
+          OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+        run: |
+          set -Eeuo pipefail
+          RESPONSE="$(curl --fail --silent --show-error \
+            -X POST "$WORKER_URL" \
+            -H "Authorization: Bearer $OIDC_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"op\":\"claim\",\"run_id\":${GITHUB_RUN_ID}}")"
+          printf '%s\n' "$RESPONSE" | jq .
+
+          JOB_ID="$(printf '%s' "$RESPONSE" | jq -r '.job.id // empty')"
+          if [ -z "$JOB_ID" ]; then
+            echo "has_job=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          printf '%s' "$RESPONSE" | jq -r '.job.source_url' > "$RUNNER_TEMP/source_url"
+          printf '%s' "$RESPONSE" | jq -r '.job.filename' > "$RUNNER_TEMP/filename"
+          printf '%s' "$RESPONSE" | jq -r '.job.drive_path' > "$RUNNER_TEMP/drive_path"
+          printf '%s' "$RESPONSE" | jq -c '.job.metadata // {}' > "$RUNNER_TEMP/metadata.json"
+          echo "has_job=true" >> "$GITHUB_OUTPUT"
+          echo "job_id=$JOB_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Validate job URL
+        if: steps.claim.outputs.has_job == 'true'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          export SOURCE_URL="$(cat "$RUNNER_TEMP/source_url")"
+          export DEST_FILENAME="$(cat "$RUNNER_TEMP/filename")"
+          export DRIVE_PATH="$(cat "$RUNNER_TEMP/drive_path")"
           python3 - <<'PY'
-          import ipaddress
-          import os
-          import socket
+          import ipaddress, os, socket
           from urllib.parse import urlsplit
 
           url = os.environ["SOURCE_URL"].strip()
           filename = os.environ["DEST_FILENAME"].strip()
           drive_path = os.environ["DRIVE_PATH"].strip()
-
           p = urlsplit(url)
-          if p.scheme != "https":
-              raise SystemExit("Only https:// URLs are allowed.")
-          if not p.hostname:
-              raise SystemExit("URL hostname is required.")
+          if p.scheme != "https" or not p.hostname:
+              raise SystemExit("Only valid https:// URLs are allowed")
           if p.username or p.password:
-              raise SystemExit("Credentials embedded in URLs are not allowed.")
-
-          if (
-              not filename
-              or filename in {".", ".."}
-              or "/" in filename
-              or "\\" in filename
-              or any(ord(c) < 32 for c in filename)
-          ):
-              raise SystemExit("Invalid destination filename.")
+              raise SystemExit("Credentials embedded in URL are not allowed")
+          if not filename or filename in {".", ".."} or "/" in filename or "\\" in filename:
+              raise SystemExit("Invalid destination filename")
           if not drive_path or ".." in drive_path.split("/"):
-              raise SystemExit("Invalid Drive path.")
-
-          host = p.hostname.lower()
-          if host in {"localhost", "localhost.localdomain"}:
-              raise SystemExit("Localhost is not allowed.")
-
-          try:
-              infos = socket.getaddrinfo(host, p.port or 443, type=socket.SOCK_STREAM)
-          except socket.gaierror as e:
-              raise SystemExit(f"DNS resolution failed: {e}")
-
+              raise SystemExit("Invalid Drive path")
+          if p.hostname.lower() in {"localhost", "localhost.localdomain"}:
+              raise SystemExit("Localhost is not allowed")
+          infos = socket.getaddrinfo(p.hostname, p.port or 443, type=socket.SOCK_STREAM)
           for info in infos:
-              addr = info[4][0]
-              ip = ipaddress.ip_address(addr)
-              if (
-                  ip.is_private
-                  or ip.is_loopback
-                  or ip.is_link_local
-                  or ip.is_multicast
-                  or ip.is_reserved
-                  or ip.is_unspecified
-              ):
+              ip = ipaddress.ip_address(info[4][0])
+              if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified:
                   raise SystemExit(f"Refusing non-public destination IP: {ip}")
-
-          print("Input validation OK")
+          print("URL validation OK")
           PY
 
-      - name: Install rclone
-        shell: bash
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y rclone
-
-      - name: Restore Google Drive credentials
+      - name: Mark downloading
+        if: steps.claim.outputs.has_job == 'true'
         shell: bash
         env:
-          RCLONE_CONFIG_B64: ${{ secrets.RCLONE_CONFIG_B64 }}
+          OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+          JOB_ID: ${{ steps.claim.outputs.job_id }}
         run: |
-          test -n "$RCLONE_CONFIG_B64" || {
-            echo "Missing repository secret: RCLONE_CONFIG_B64"
-            exit 1
-          }
-          mkdir -p "$HOME/.config/rclone"
-          printf '%s' "$RCLONE_CONFIG_B64" | base64 --decode > "$HOME/.config/rclone/rclone.conf"
-          chmod 600 "$HOME/.config/rclone/rclone.conf"
-          rclone listremotes | grep -qx 'gdrive:' || {
-            echo "rclone config must contain a remote named gdrive"
-            exit 1
-          }
+          curl --fail --silent --show-error \
+            -X POST "$WORKER_URL" \
+            -H "Authorization: Bearer $OIDC_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"op\":\"update\",\"job_id\":\"$JOB_ID\",\"status\":\"downloading\"}" | jq .
 
-      - name: Stream URL directly to Google Drive
-        id: transfer
+      - name: Download online file and hash
+        if: steps.claim.outputs.has_job == 'true'
+        id: download
+        continue-on-error: true
         shell: bash
         run: |
           set -Eeuo pipefail
-          REMOTE_PATH="${DRIVE_PATH%/}/${DEST_FILENAME}"
-          HASH_FILE="$RUNNER_TEMP/sha256.txt"
-
+          SOURCE_URL="$(cat "$RUNNER_TEMP/source_url")"
+          OUT="$RUNNER_TEMP/workbrain-download.bin"
           curl \
             --proto '=https' \
             --tlsv1.2 \
@@ -134,28 +132,76 @@ jobs:
             --speed-limit 1024 \
             --silent \
             --show-error \
-            "$SOURCE_URL" \
-          | tee >(sha256sum | awk '{print $1}' > "$HASH_FILE") \
-          | rclone rcat "gdrive:${REMOTE_PATH}" \
-              --stats 30s \
-              --stats-one-line \
-              --retries 4 \
-              --low-level-retries 10
-
-          SHA256="$(cat "$HASH_FILE")"
+            --output "$OUT" \
+            "$SOURCE_URL"
+          SIZE="$(stat -c%s "$OUT")"
+          SHA256="$(sha256sum "$OUT" | awk '{print $1}')"
+          echo "size=$SIZE" >> "$GITHUB_OUTPUT"
           echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
-          echo "remote_path=$REMOTE_PATH" >> "$GITHUB_OUTPUT"
-          rclone lsl "gdrive:${REMOTE_PATH}"
+          echo "Downloaded $SIZE bytes; sha256=$SHA256"
+
+      - name: Report smoke-test success
+        if: steps.claim.outputs.has_job == 'true' && steps.download.outcome == 'success'
+        shell: bash
+        env:
+          OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+          JOB_ID: ${{ steps.claim.outputs.job_id }}
+          SIZE: ${{ steps.download.outputs.size }}
+          SHA256: ${{ steps.download.outputs.sha256 }}
+        run: |
+          curl --fail --silent --show-error \
+            -X POST "$WORKER_URL" \
+            -H "Authorization: Bearer $OIDC_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data-binary @- <<JSON | jq .
+          {
+            "op":"update",
+            "job_id":"$JOB_ID",
+            "status":"completed",
+            "size_bytes":$SIZE,
+            "bytes_downloaded":$SIZE,
+            "sha256":"$SHA256",
+            "metadata":{
+              "bridge_phase":"github_download_smoke_test",
+              "online_download_verified":true,
+              "drive_upload_verified":false,
+              "runner":"ubuntu-latest"
+            }
+          }
+          JSON
+
+      - name: Report download failure
+        if: steps.claim.outputs.has_job == 'true' && steps.download.outcome == 'failure'
+        shell: bash
+        env:
+          OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+          JOB_ID: ${{ steps.claim.outputs.job_id }}
+        run: |
+          curl --silent --show-error \
+            -X POST "$WORKER_URL" \
+            -H "Authorization: Bearer $OIDC_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data-binary @- <<JSON | jq .
+          {
+            "op":"update",
+            "job_id":"$JOB_ID",
+            "status":"failed",
+            "error_detail":"GitHub runner could not download the source URL",
+            "metadata":{"bridge_phase":"github_download_smoke_test"}
+          }
+          JSON
+          exit 1
 
       - name: Summary
+        if: always()
         shell: bash
         run: |
           {
-            echo "## Download completed"
+            echo "## WorkBrain worker"
             echo
-            echo "- Source: \`${SOURCE_URL}\`"
-            echo "- Drive: \`gdrive:${{ steps.transfer.outputs.remote_path }}\`"
-            echo "- SHA-256: \`${{ steps.transfer.outputs.sha256 }}\`"
-            echo
-            echo "No GitHub Actions Artifact or cache was created."
+            echo "- Repository: $GITHUB_REPOSITORY"
+            echo "- Trigger: $GITHUB_EVENT_NAME"
+            echo "- GitHub -> Supabase auth: OIDC (no PAT)"
+            echo "- GitHub Artifact/cache: not used"
+            echo "- Google Drive upload: next integration stage"
           } >> "$GITHUB_STEP_SUMMARY"
