@@ -1,0 +1,4 @@
+rclone.conf
+*.secret
+.env
+.DS_Store
