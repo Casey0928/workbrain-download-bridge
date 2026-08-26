@@ -16,6 +16,9 @@ on:
         required: true
         default: "WorkBrain/Downloads"
         type: string
+  push:
+    paths:
+      - ".github/test-download-trigger.txt"
 
 permissions:
   contents: read
@@ -26,9 +29,9 @@ jobs:
     timeout-minutes: 180
 
     env:
-      SOURCE_URL: ${{ inputs.url }}
-      DEST_FILENAME: ${{ inputs.filename }}
-      DRIVE_PATH: ${{ inputs.drive_path }}
+      SOURCE_URL: ${{ github.event_name == 'workflow_dispatch' && inputs.url || 'https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf' }}
+      DEST_FILENAME: ${{ github.event_name == 'workflow_dispatch' && inputs.filename || 'github-actions-bridge-test.pdf' }}
+      DRIVE_PATH: ${{ github.event_name == 'workflow_dispatch' && inputs.drive_path || 'WorkBrain/Downloads' }}
 
     steps:
       - name: Validate inputs
@@ -116,7 +119,6 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-
           REMOTE_PATH="${DRIVE_PATH%/}/${DEST_FILENAME}"
           HASH_FILE="$RUNNER_TEMP/sha256.txt"
 
