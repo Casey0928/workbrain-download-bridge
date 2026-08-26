@@ -1,2 +1,2 @@
-trigger 2026-08-26T14:41+08:00
-purpose: OIDC queue smoke test
+trigger 2026-08-26T15:57+08:00
+purpose: full GitHub Actions -> Supabase upload session -> Google Drive test
