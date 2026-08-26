@@ -1,0 +1,2 @@
+trigger 2026-08-26T14:41+08:00
+purpose: OIDC queue smoke test
