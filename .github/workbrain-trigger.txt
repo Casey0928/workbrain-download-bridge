@@ -1,2 +1,2 @@
-trigger 2026-09-05T10:41+08:00
-purpose: rerun final acceptance test with Drive diagnostics
+trigger 2026-09-05T10:43+08:00
+purpose: final acceptance test after Google Drive reauthorization
