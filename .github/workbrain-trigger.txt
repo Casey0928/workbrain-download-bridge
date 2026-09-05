@@ -1,2 +1,2 @@
-trigger 2026-08-26T15:57+08:00
-purpose: full GitHub Actions -> Supabase upload session -> Google Drive test
+trigger 2026-09-05T10:38+08:00
+purpose: final deployment acceptance test -> Supabase -> GitHub Actions -> Google Drive
