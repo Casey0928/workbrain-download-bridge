@@ -4,7 +4,10 @@ set -euo pipefail
 RECOVERY_REPO="Casey0928/wechat-codespace"
 RECOVERY_BRANCH="muse-recovery"
 RECOVERY_SUBDIR="muse-recovery"
-TARGET="${MUSE_RECOVERY_SOURCE:-${HOME:-/home/hatch}/muse-recovery-src}"
+if [ -d /home/hatch ]; then
+  export HOME="${MUSE_HOME:-/home/hatch}"
+fi
+TARGET="${MUSE_RECOVERY_SOURCE:-${HOME:-/root}/muse-recovery-src}"
 
 log() { printf '[muse-bootstrap] %s\n' "$*"; }
 die() { printf '[muse-bootstrap] ERROR: %s\n' "$*" >&2; exit 1; }
